@@ -1,18 +1,8 @@
-# --- Core ---
 streamlit==1.38.0
 pandas==2.2.2
 numpy==1.26.4
-
-# --- Numerics (con wheels compatibles) ---
 scipy==1.11.4
-scikit-learn==1.3.2
-Cython==0.29.36
-
-# --- Forecasting ---
 statsmodels==0.14.1
-pmdarima==2.0.4
-
-# --- Viz & Excel ---
 plotly==5.22.0
 xlsxwriter==3.2.0
 openpyxl==3.1.5
