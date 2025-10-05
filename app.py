@@ -296,7 +296,7 @@ if servicios_fore:
                 st.success(f"Mejor método: {metrics['best']}")
             else:
                 st.info("Serie corta para backtesting; se usó SeasonalNaive por defecto.")
-
+                
             out = df_fc.copy()
             out["servicio"] = svc
             out = out[["fecha","servicio","yhat"]]
