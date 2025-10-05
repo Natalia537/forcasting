@@ -13,7 +13,13 @@ import pandas as pd
 import streamlit as st
 
 # Modelado
-from statsmodels.tsa.holtwinters import ExponentialSmoothing
+# statsmodels es opcional; si no está, hacemos un fallback simple
+try:
+    from statsmodels.tsa.holtwinters import ExponentialSmoothing
+    HAVE_STATSMODELS = True
+except Exception:
+    ExponentialSmoothing = None
+    HAVE_STATSMODELS = False
 # ARIMA opcional (pmdarima puede fallar en algunos entornos sin wheels)
 try:
     from pmdarima import auto_arima
@@ -167,16 +173,35 @@ def smape(y_true: np.ndarray, y_pred: np.ndarray) -> float:
 
 
 def fit_ets(series: pd.Series, seasonal_periods: int = 12):
-    # Aditivo por defecto; si hay valores 0, ETS puede correr aditivo sin problema
-    model = ExponentialSmoothing(
-        series,
-        trend="add",
-        seasonal="add",
-        seasonal_periods=seasonal_periods,
-        initialization_method="estimated",
-    )
-    res = model.fit(optimized=True)
-    return res
+    """Intenta ETS (Holt-Winters). Si statsmodels no está disponible, usa Holt lineal simple como fallback."""
+    if HAVE_STATSMODELS:
+        model = ExponentialSmoothing(
+            series,
+            trend="add",
+            seasonal="add",
+            seasonal_periods=seasonal_periods,
+            initialization_method="estimated",
+        )
+        res = model.fit(optimized=True)
+        return res
+    else:
+        # Fallback: implementamos Holt lineal básico
+        alpha, beta = 0.3, 0.1
+        y = series
+        level = y.iloc[0]
+        trend = (y.iloc[1] - y.iloc[0]) if len(y) > 1 else 0.0
+        for t in range(1, len(y)):
+            prev_level = level
+            level = alpha * y.iloc[t] + (1 - alpha) * (level + trend)
+            trend = beta * (level - prev_level) + (1 - beta) * trend
+        class _Res:
+            def __init__(self, l, b):
+                self._l = l; self._b = b
+                self.resid = np.array([])  # no resid disponible
+            def forecast(self, h):
+                return pd.Series([self._l + (i+1)*self._b for i in range(h)],
+                                 index=pd.date_range(y.index[-1] + pd.offsets.MonthBegin(1), periods=h, freq="MS"))
+        return _Res(level, trend)
 
 
 def fit_auto_arima(series: pd.Series, seasonal_periods: int = 12):
@@ -292,17 +317,23 @@ def fit_and_forecast(series: pd.Series, horizon: int = 6, seasonal_periods: int 
         pred_idx = pd.period_range(series.index[-1].to_period("M").to_timestamp(), periods=horizon+1, freq="MS")[1:]
         df_fc = pd.DataFrame({"fecha": pred_idx, "yhat": fc})
     else:
-        # ETS por defecto
+        # ETS por defecto o fallback Holt
         fit = fit_ets(series, seasonal_periods)
         fc = fit.forecast(horizon)
-        ci_low = fc - 1.96 * np.std(fit.resid, ddof=1)
-        ci_hi = fc + 1.96 * np.std(fit.resid, ddof=1)
-        df_fc = pd.DataFrame({
-            "fecha": fc.index,
-            "yhat": fc.values,
-            "yhat_lower": ci_low.values,
-            "yhat_upper": ci_hi.values,
-        })
+        if hasattr(fit, 'resid') and isinstance(fit.resid, (np.ndarray, list)) and len(getattr(fit,'resid',[]))>0:
+            ci_low = fc - 1.96 * np.std(fit.resid, ddof=1)
+            ci_hi = fc + 1.96 * np.std(fit.resid, ddof=1)
+            df_fc = pd.DataFrame({
+                "fecha": fc.index,
+                "yhat": fc.values,
+                "yhat_lower": ci_low.values,
+                "yhat_upper": ci_hi.values,
+            })
+        else:
+            df_fc = pd.DataFrame({
+                "fecha": fc.index,
+                "yhat": fc.values,
+            })
     return metrics, df_fc
 
 
