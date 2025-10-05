@@ -14,7 +14,12 @@ import streamlit as st
 
 # Modelado
 from statsmodels.tsa.holtwinters import ExponentialSmoothing
-from pmdarima import auto_arima
+# ARIMA opcional (pmdarima puede fallar en algunos entornos sin wheels)
+try:
+    from pmdarima import auto_arima
+    HAVE_PMDARIMA = True
+except Exception:
+    HAVE_PMDARIMA = False
 
 # Visualización
 import plotly.express as px
@@ -175,6 +180,8 @@ def fit_ets(series: pd.Series, seasonal_periods: int = 12):
 
 
 def fit_auto_arima(series: pd.Series, seasonal_periods: int = 12):
+    if not HAVE_PMDARIMA:
+        raise RuntimeError("pmdarima no disponible en este entorno")
     model = auto_arima(
         series,
         seasonal=True,
@@ -189,11 +196,52 @@ def fit_auto_arima(series: pd.Series, seasonal_periods: int = 12):
 
 def time_series_cv(series: pd.Series, horizon: int = 3, initial: int = 24, step: int = 1) -> dict:
     """Backtesting simple expandiendo ventana.
-    Retorna métricas para ETS y ARIMA y elige el mejor por sMAPE.
+    Retorna métricas para ETS y (si está disponible) ARIMA y elige el mejor por sMAPE.
     """
     y = series.dropna()
     if len(y) < max(initial, horizon) + 3:
         return {"best": None, "ets": None, "arima": None}
+
+    ets_preds, arima_preds, y_trues = [], [], []
+
+    for end in range(initial, len(y) - horizon + 1, step):
+        train = y.iloc[:end]
+        test = y.iloc[end:end + horizon]
+
+        # ETS
+        try:
+            ets_fit = fit_ets(train)
+            f_ets = ets_fit.forecast(horizon)
+        except Exception:
+            f_ets = pd.Series([np.nan] * horizon, index=test.index)
+
+        # ARIMA (solo si disponible)
+        if HAVE_PMDARIMA:
+            try:
+                arima_fit = fit_auto_arima(train)
+                f_ari = pd.Series(arima_fit.predict(n_periods=horizon), index=test.index)
+            except Exception:
+                f_ari = pd.Series([np.nan] * horizon, index=test.index)
+        else:
+            f_ari = pd.Series([np.nan] * horizon, index=test.index)
+
+        ets_preds.append(f_ets.values)
+        arima_preds.append(f_ari.values)
+        y_trues.append(test.values)
+
+    ets_preds = np.concatenate(ets_preds)
+    arima_preds = np.concatenate(arima_preds)
+    y_trues = np.concatenate(y_trues)
+
+    mets = smape(y_trues, ets_preds)
+    mari = smape(y_trues, arima_preds) if HAVE_PMDARIMA else np.inf
+
+    best = "ETS" if mets <= mari else "ARIMA"
+    return {
+        "best": best,
+        "ets": {"sMAPE": mets},
+        "arima": ({"sMAPE": mari} if HAVE_PMDARIMA else None),
+    }"best": None, "ets": None, "arima": None}
 
     ets_preds, arima_preds, y_trues = [], [], []
 
@@ -238,10 +286,9 @@ def fit_and_forecast(series: pd.Series, horizon: int = 6, seasonal_periods: int 
     metrics = time_series_cv(series, horizon=min(horizon, 6), initial=min(24, max(12, len(series)//2)))
     best = metrics.get("best") if metrics else None
 
-    if best == "ARIMA":
+    if best == "ARIMA" and HAVE_PMDARIMA:
         model = fit_auto_arima(series, seasonal_periods)
         fc = model.predict(n_periods=horizon)
-        # Auto-ARIMA no da intervalos de confianza fácilmente sin steps extra; omitimos IC para simplicidad
         pred_idx = pd.period_range(series.index[-1].to_period("M").to_timestamp(), periods=horizon+1, freq="MS")[1:]
         df_fc = pd.DataFrame({"fecha": pred_idx, "yhat": fc})
     else:
@@ -390,15 +437,16 @@ if file is not None:
                 # Métricas
                 st.subheader("Métricas de backtesting (sMAPE ↓)")
                 if metrics and metrics.get("best"):
-                    met_df = pd.DataFrame({
-                        "Modelo": ["ETS", "ARIMA", "Mejor"],
-                        "sMAPE": [
-                            metrics["ets"]["sMAPE"],
-                            metrics["arima"]["sMAPE"],
-                            min(metrics["ets"]["sMAPE"], metrics["arima"]["sMAPE"]),
-                        ],
-                    })
+                    rows = [["ETS", metrics["ets"]["sMAPE"]]]
+                    if metrics.get("arima"):
+                        rows.append(["ARIMA", metrics["arima"]["sMAPE"]])
+                        rows.append(["Mejor", min(metrics["ets"]["sMAPE"], metrics["arima"]["sMAPE"])])
+                    else:
+                        rows.append(["Mejor", metrics["ets"]["sMAPE"]])
+                    met_df = pd.DataFrame(rows, columns=["Modelo", "sMAPE"]) 
                     st.dataframe(met_df)
+                    if not HAVE_PMDARIMA:
+                        st.info("ARIMA no disponible en este entorno. Se usó ETS y backtesting con ETS.")
                 else:
                     st.info("Serie demasiado corta para backtesting robusto; se utilizó un modelo por defecto.")
 
@@ -429,4 +477,4 @@ if file is not None:
 else:
     st.info("Subí un archivo Excel/CSV para comenzar.")
 
-st.caption("Hecho con ❤️ en Streamlit • Modelos: ETS (statsmodels) y Auto-ARIMA (pmdarima)")
+st.caption("Hecho en Streamlit • Modelos: ETS (statsmodels) y Auto-ARIMA (pmdarima)")
