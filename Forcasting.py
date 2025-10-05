@@ -1,7 +1,6 @@
 # app.py
 # Streamlit app para cargar ventas/servicios mensuales del Taller de Moto,
 # explorar datos y pronosticar la DEMANDA por servicio.
-# Autor: ChatGPT (Naty project)
 
 import io
 import json
