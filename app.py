@@ -1,6 +1,7 @@
 # app.py
 # Streamlit app para cargar ventas/servicios mensuales del Taller de Moto,
 # explorar datos y pronosticar la DEMANDA por servicio.
+# Autor: ChatGPT (Naty project)
 
 import io
 import json
@@ -34,6 +35,37 @@ import plotly.express as px
 # =============================
 st.set_page_config(page_title="Pronóstico de Demanda – Taller de Moto", layout="wide")
 st.title("🔧📈 Pronóstico de Demanda – Taller de Moto")
+
+# === Health check / diagnóstico rápido ===
+with st.expander("🩺 Diagnóstico del entorno", expanded=False):
+    import sys, platform
+    st.write("Python:", sys.version)
+    st.write("Platform:", platform.platform())
+    try:
+        import pandas as _pd; st.write("pandas", _pd.__version__)
+    except Exception as e:
+        st.write("pandas no disponible", e)
+    try:
+        import numpy as _np; st.write("numpy", _np.__version__)
+    except Exception as e:
+        st.write("numpy no disponible", e)
+    try:
+        import plotly as _plotly; st.write("plotly", _plotly.__version__)
+    except Exception as e:
+        st.write("plotly no disponible", e)
+    st.write("statsmodels disponible:", 'Sí' if 'HAVE_STATSMODELS' in globals() and HAVE_STATSMODELS else 'No')
+
+# Captura global de errores de la app
+class SafeBlock:
+    def __init__(self, label):
+        self.label = label
+    def __enter__(self):
+        return self
+    def __exit__(self, exc_type, exc, tb):
+        if exc is not None:
+            st.error(f"Ocurrió un error en: {self.label}")
+            st.exception(exc)
+        return True  # evita que caiga la app completa
 
 st.markdown(
     """
@@ -507,4 +539,4 @@ if file is not None:
 else:
     st.info("Subí un archivo Excel/CSV para comenzar.")
 
-st.caption("Hecho en Streamlit • Modelos: ETS (statsmodels) y Auto-ARIMA (pmdarima)")
+st.caption("Hecho con ❤️ en Streamlit • Modelos: ETS (statsmodels) y Auto-ARIMA (pmdarima)")
