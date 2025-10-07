@@ -1,4 +1,4 @@
-# app.py — Pronóstico Taller: 5 métodos (parámetros fijos α=β=γ=0.10), fórmulas correctas
+# app.py — Pronóstico Taller: 5 métodos (α=β=γ=0.10) + fix fallback Winter
 import io
 from datetime import datetime
 from typing import Dict, Tuple, List
@@ -7,7 +7,6 @@ import numpy as np
 import pandas as pd
 import plotly.express as px
 import streamlit as st
-
 
 # ==========================
 # Configuración general
@@ -125,7 +124,7 @@ def fc_naive(y: pd.Series, h: int) -> np.ndarray:
     return np.repeat(y.iloc[-1], h)
 
 def fc_ses(y: pd.Series, h: int, alpha: float = ALPHA) -> np.ndarray:
-    # Exponencial simple: L_t = αY_t + (1-α)L_{t-1}; pronóstico = L_t
+    # Exponencial simple
     y = y.astype(float)
     L = y.iloc[0]
     for t in range(1, len(y)):
@@ -133,7 +132,7 @@ def fc_ses(y: pd.Series, h: int, alpha: float = ALPHA) -> np.ndarray:
     return np.repeat(L, h)
 
 def fc_holt(y: pd.Series, h: int, alpha: float = ALPHA, beta: float = BETA) -> np.ndarray:
-    # Holt (aditivo): L_t = αY_t + (1-α)(L_{t-1}+B_{t-1}); B_t = β(L_t-L_{t-1}) + (1-β)B_{t-1}
+    # Holt aditivo
     y = y.astype(float)
     if len(y) < 2:
         return fc_naive(y, h)
@@ -145,8 +144,16 @@ def fc_holt(y: pd.Series, h: int, alpha: float = ALPHA, beta: float = BETA) -> n
         B = beta * (L - L_prev) + (1 - beta) * B
     return np.array([L + (i+1)*B for i in range(h)], dtype=float)
 
+# --- Auxiliar SOLO para fallback cuando hay < m meses ---
+def fc_seasonal_naive(y: pd.Series, h: int, m: int = 12) -> np.ndarray:
+    if len(y) < m:
+        return fc_naive(y, h)
+    last_season = y.iloc[-m:].values
+    reps = int(np.ceil(h/m))
+    return np.tile(last_season, reps)[:h]
+
 def _init_seasonal_multiplicative(y: pd.Series, m: int = 12) -> Tuple[float, float, np.ndarray]:
-    # Inicialización clásica de HW multiplicativo (ratios a medias estacionales)
+    # Inicialización clásica para HW multiplicativo
     n = len(y)
     k = n // m
     if k >= 2:
@@ -157,8 +164,8 @@ def _init_seasonal_multiplicative(y: pd.Series, m: int = 12) -> Tuple[float, flo
     else:
         first = y.iloc[:m].values
         S = first / first.mean()
-    S = S * (m / S.sum())        # Normalizar a promedio 1.0
-    L0 = (y.iloc[:m] / S).mean() # Nivel inicial
+    S = S * (m / S.sum())
+    L0 = (y.iloc[:m] / S).mean()
     if k >= 2:
         L1 = (y.iloc[m:2*m] / S).mean()
         B0 = (L1 - L0) / m
@@ -170,18 +177,16 @@ def _init_seasonal_multiplicative(y: pd.Series, m: int = 12) -> Tuple[float, flo
 
 def fc_hw_mul(y: pd.Series, h: int, alpha: float = ALPHA, beta: float = BETA,
               gamma: float = GAMMA, m: int = 12) -> np.ndarray:
-    # Holt–Winters multiplicativo (convención 1 paso adelante con S_{t-m})
+    # Holt–Winters multiplicativo
     y = y.astype(float)
     if len(y) < m + 2:
+        # Fallback seguro: si no hay estacionalidad suficiente, usa Naive (o SA)
         return fc_naive(y, h) if len(y) < m else fc_seasonal_naive(y, h, m)
     L, B, S = _init_seasonal_multiplicative(y, m=m)
-    S_list = list(S)   # S_t se actualiza en la misma posición t (tiene memoria m)
-
+    S_list = list(S)
     for t in range(len(y)):
         s_idx = t - m
         S_tm = S_list[s_idx] if s_idx >= 0 else S_list[s_idx % m]
-        # Pronóstico de 1 paso para el tiempo t (usando estado t-1)
-        # F_t = (L + B) * S_{t-m}
         Yt = y.iloc[t]
         L_new = alpha * (Yt / S_tm) + (1 - alpha) * (L + B)
         B_new = beta  * (L_new - L) + (1 - beta) * B
@@ -192,7 +197,6 @@ def fc_hw_mul(y: pd.Series, h: int, alpha: float = ALPHA, beta: float = BETA,
         else:
             S_list.append(S_new)
 
-    # Pronóstico futuro k pasos: (L + kB) * S_{t-m+k}
     idx = pd.date_range(y.index[-1] + pd.offsets.MonthBegin(1), periods=h, freq="MS")
     fc = []
     for k_ahead in range(1, h+1):
@@ -202,7 +206,6 @@ def fc_hw_mul(y: pd.Series, h: int, alpha: float = ALPHA, beta: float = BETA,
     return np.array(fc, dtype=float)
 
 def fc_moving_average(y: pd.Series, h: int, window: int = 3) -> np.ndarray:
-    # Promedio móvil simple de ventana w: pronóstico constante = media de los últimos w
     w = max(1, min(window, len(y)))
     ma = y.rolling(window=w).mean().iloc[-1]
     return np.repeat(ma, h)
@@ -212,7 +215,6 @@ def fc_moving_average(y: pd.Series, h: int, window: int = 3) -> np.ndarray:
 # ==========================
 def backtest_fixed(y: pd.Series, method: str, horizon: int, m: int = 12, ma_window: int = 3) -> float:
     errs: List[float] = []
-    # usar como "entrenamiento" al menos 12 meses o mitad de la serie (lo que sea mayor)
     initial = min(max(12, len(y)//2), len(y)-horizon-1)
     if initial <= 0:
         return np.inf
@@ -322,7 +324,6 @@ def export_all_sheets(dfs: Dict[str,pd.DataFrame], metrics: Dict[str,float], fna
 def run_block(title: str, g: pd.DataFrame):
     st.subheader(title)
     y = g.set_index("fecha")["cantidad"].astype(float)
-
     df_all, metrics, dfs = forecast_all_fixed(y, horizon=horizonte, m=SEASON_M, ma_window=ma_window)
 
     # Mejor por sMAPE
@@ -345,17 +346,15 @@ def run_block(title: str, g: pd.DataFrame):
     st.dataframe(pd.DataFrame(sorted(metrics.items(), key=lambda x: x[1]), columns=["Modelo","sMAPE"]),
                  use_container_width=True)
 
-    # Tabs por método (gráfica + tabla)
+    # Tabs por método
     st.subheader("Tablas y gráficas por método")
     tabs = st.tabs(list(dfs.keys()))
     for tab, (name, d) in zip(tabs, dfs.items()):
         with tab:
             st.write(f"**{name}**  • sMAPE={metrics[name]:.3f}")
-            # Gráfica individual
             fig_i = px.line(pd.concat([hist, d.rename(columns={"yhat":"y"}).assign(serie=name)]),
                             x="fecha", y="y", color="serie", title=f"{title} – {name}", markers=True)
             st.plotly_chart(fig_i, use_container_width=True)
-            # Tabla Yhat
             st.dataframe(d, use_container_width=True)
 
     # Exportar Excel
