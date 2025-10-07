@@ -1,27 +1,28 @@
-# app.py — Pronóstico Taller Moto: compara todos los métodos, muestra errores y exporta Excel por método
+# app.py — Pronóstico Taller (5 métodos con tuning y backtesting; sin librerías pesadas)
 import io
+from datetime import datetime
+from typing import Dict, Tuple, List
+
 import numpy as np
 import pandas as pd
 import plotly.express as px
 import streamlit as st
-from datetime import datetime
 
-# =============================
-# Config & título
-# =============================
-st.set_page_config(page_title="Pronóstico Taller Moto", layout="wide")
-st.title("🔧📈 Pronóstico de Demanda – Taller de Moto (Cloud-safe)")
+
+# =============== Config ===============
+st.set_page_config(page_title="Pronóstico Taller", layout="wide")
+st.title("🔧📈 Pronóstico de Demanda – 5 métodos (tuning & backtesting)")
 
 st.markdown("""
-Subí un **Excel/CSV** con columnas: **fecha**, **servicio**, **cantidad**, **precio**.  
-La app agrega a **mensual**, hace EDA y pronostica por **servicio / tipo / total** con métodos livianos:
-**Naive, SeasonalNaive, MovingAvg, WMA, SES, Holt, LinearTrend, Croston**.  
-Ahora ves **cada método** con su **gráfica**, su **tabla de Y** y su **error (sMAPE)**; además podés **descargar un Excel** con **una hoja por método**.
+Subí un archivo **Excel/CSV** con columnas:
+- **fecha**, **servicio**, **cantidad**, **precio**.
+
+La app normaliza a **mensual**, evalúa 5 métodos con **backtesting** y **elige el mejor** por sMAPE:
+**Naive, SeasonalNaive, Holt, Holt-Winters multiplicativo y Croston**.
+Podés ver **curvas, tablas y métricas**; además descargar un **Excel** con una hoja por método.
 """)
 
-# =============================
-# Catálogo Servicio → Tipo
-# =============================
+# =============== Helpers de fechas / schema ===============
 SERVICIO_TIPO = {
     "Lavado y detallado de motos": "Lavado",
     "Lavado aspirado de carros": "Lavado",
@@ -49,186 +50,268 @@ SERVICIO_TIPO = {
     "Instalación de accesorios": "Reparación",
 }
 
-# =============================
-# Limpieza y schema
-# =============================
 def _try_parse_date(s: pd.Series) -> pd.Series:
-    parsed = pd.to_datetime(s, errors="coerce", infer_datetime_format=True)
+    parsed = pd.to_datetime(s, errors="coerce", infer_datetime_format=True, utc=False)
     if parsed.isna().any():
         meses = {"ene":"01","feb":"02","mar":"03","abr":"04","may":"05","jun":"06",
                  "jul":"07","ago":"08","sep":"09","oct":"10","nov":"11","dic":"12"}
         def repl(x):
             if not isinstance(x, str): return x
             y = x.lower().strip()
-            for k,v in meses.items(): y = y.replace(f"{k}-", f"{v}-")
+            for k,v in meses.items():
+                y = y.replace(f"{k}-", f"{v}-")
             return y
         parsed2 = pd.to_datetime(s.apply(repl), errors="coerce", dayfirst=True)
         parsed = parsed.fillna(parsed2)
     return parsed
 
-def coerce_schema(df: pd.DataFrame, cols: dict) -> pd.DataFrame:
+def coerce_schema(df: pd.DataFrame, cols: Dict[str,str]) -> pd.DataFrame:
     df = df.rename(columns={
-        cols["fecha"]: "fecha",
-        cols["servicio"]: "servicio",
-        cols["cantidad"]: "cantidad",
-        cols["precio"]: "precio"
+        cols["fecha"]:"fecha",
+        cols["servicio"]:"servicio",
+        cols["cantidad"]:"cantidad",
+        cols["precio"]:"precio"
     }).copy()
-
     df["fecha"] = _try_parse_date(df["fecha"])
     if df["fecha"].isna().any():
-        raise ValueError("Hay fechas inválidas en la columna seleccionada.")
+        raise ValueError("No se pudieron parsear algunas fechas.")
     df["servicio"] = df["servicio"].astype(str).str.strip()
     df["cantidad"] = pd.to_numeric(df["cantidad"], errors="coerce").fillna(0.0)
     df["precio"]   = pd.to_numeric(df["precio"], errors="coerce")
 
+    # mensual
     df["fecha_mes"] = df["fecha"].dt.to_period("M").dt.to_timestamp()
-    g = df.groupby(["servicio","fecha_mes"], as_index=False).agg({"cantidad":"sum","precio":"mean"})
-    g = g.rename(columns={"fecha_mes":"fecha"})
+    g = (df.groupby(["servicio","fecha_mes"], as_index=False)
+           .agg(cantidad=("cantidad","sum"), precio=("precio","mean"))
+           .rename(columns={"fecha_mes":"fecha"}))
 
-    full = []
+    # reindex por servicio (meses faltantes)
+    outs = []
     for svc, gi in g.groupby("servicio"):
         idx = pd.date_range(gi["fecha"].min(), gi["fecha"].max(), freq="MS")
         gi2 = gi.set_index("fecha").reindex(idx).rename_axis("fecha").reset_index()
         gi2["servicio"] = svc
         gi2["cantidad"] = gi2["cantidad"].fillna(0.0)
         gi2["precio"]   = gi2["precio"].ffill().bfill()
-        full.append(gi2)
+        outs.append(gi2)
 
-    dfm = pd.concat(full, ignore_index=True)
+    dfm = pd.concat(outs, ignore_index=True)
     dfm["tipo_servicio"] = dfm["servicio"].map(SERVICIO_TIPO)
     dfm["ingreso"] = dfm["cantidad"] * dfm["precio"].fillna(0)
     return dfm[["fecha","servicio","tipo_servicio","cantidad","precio","ingreso"]]
 
-# =============================
-# Modelos de pronóstico
-# =============================
-def smape(y_true, y_pred):
-    y_true = np.array(y_true, dtype=float)
-    y_pred = np.array(y_pred, dtype=float)
-    denom = np.abs(y_true)+np.abs(y_pred)
-    denom = np.where(denom==0,1,denom)
-    return float(100*np.mean(2*np.abs(y_true-y_pred)/denom))
+# =============== Métricas ===============
+def smape(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
+    denom = np.abs(y_true) + np.abs(y_pred)
+    denom = np.where(denom == 0, 1.0, denom)
+    return float(100.0*np.mean(2.0*np.abs(y_true - y_pred)/denom))
 
-def _naive(y,h): 
+# =============== Métodos base (5) ===============
+def fc_naive(y: pd.Series, h: int) -> np.ndarray:
     return np.repeat(y.iloc[-1], h)
 
-def _seasonal_naive(y,h,m=12):
-    m_eff = min(m, max(1, len(y)))
-    if len(y) < 2: 
-        return _naive(y,h)
-    vals = []
-    for i in range(1, h+1):
-        idx = -m_eff + (i-1) % m_eff
-        vals.append(y.iloc[idx])
-    return np.array(vals)
+def fc_seasonal_naive(y: pd.Series, h: int, m: int=12) -> np.ndarray:
+    if len(y) < m:
+        return fc_naive(y, h)
+    last_season = y.iloc[-m:].values
+    reps = int(np.ceil(h/m))
+    return np.tile(last_season, reps)[:h]
 
-def _moving_average(y,h,w=3):
-    ma = y.rolling(window=min(w,len(y))).mean().iloc[-1]
-    return np.repeat(ma, h)
+def fc_holt(y: pd.Series, h: int, alpha: float, beta: float) -> np.ndarray:
+    # Holt (nivel + tendencia) – formulación clásica aditiva
+    y = y.astype(float)
+    if len(y) < 2:
+        return fc_naive(y, h)
+    l = y.iloc[0]
+    b = y.iloc[1] - y.iloc[0]
+    for t in range(1, len(y)):
+        l_prev = l
+        l = alpha * y.iloc[t] + (1-alpha) * (l + b)
+        b = beta * (l - l_prev) + (1-beta)*b
+    return np.array([l + (i+1)*b for i in range(h)])
 
-def _wma(y,h,weights=(0.6,0.3,0.1)):
-    w = np.array(weights[:min(len(weights), len(y))], dtype=float)
-    w = w / w.sum()
-    last_vals = y.iloc[-len(w):].values
-    val = float(np.dot(last_vals[::-1], w))
-    return np.repeat(val, h)
+def _init_seasonal_multiplicative(y: pd.Series, m: int=12) -> Tuple[float, float, np.ndarray]:
+    # inicialización clásica para HW multiplicativo (promedios por temporada + ratios)
+    n = len(y)
+    k = n // m
+    if k >= 2:
+        seasons = y.values[:k*m].reshape(k, m)
+        season_means = seasons.mean(axis=1, keepdims=True)
+        ratios = seasons / season_means
+        S = ratios.mean(axis=0)
+    else:
+        first = y.iloc[:m].values
+        S = first / first.mean()
+    S = S * (m / S.sum())  # normalizar a promedio 1.0
+    L0 = (y.iloc[:m] / S).mean()
+    if k >= 2:
+        L1 = (y.iloc[m:2*m] / S).mean()
+        B0 = (L1 - L0) / m
+    else:
+        x = np.arange(m)
+        a, b = np.polyfit(x, (y.iloc[:m] / S).values, 1)
+        B0 = a
+    return float(L0), float(B0), S.astype(float)
 
-def _ses(y,h,alpha=0.3):
-    level=y.iloc[0]
-    for t in range(1,len(y)):
-        level = alpha*y.iloc[t] + (1-alpha)*level
-    return np.repeat(level, h)
+def fc_holt_winters_mul(y: pd.Series, h: int, alpha: float, beta: float, gamma: float, m: int=12) -> np.ndarray:
+    # HW multiplicativo: Y_t ≈ (L_{t-1}+B_{t-1}) * S_{t-m}
+    # Updates:
+    # L_t = α*(Y_t / S_{t-m}) + (1-α)*(L_{t-1}+B_{t-1})
+    # B_t = β*(L_t - L_{t-1}) + (1-β)*B_{t-1}
+    # S_t = γ*(Y_t / L_t) + (1-γ)*S_{t-m}
+    y = y.astype(float)
+    if len(y) < m+2:
+        return fc_seasonal_naive(y, h, m=m)
+    L, B, S = _init_seasonal_multiplicative(y, m=m)
+    L_hist = [L]; B_hist = [B]; S_list = list(S)  # S_list va creciendo
 
-def _holt(y,h,a=0.3,b=0.1):
-    level=y.iloc[0]
-    trend=y.iloc[1]-y.iloc[0] if len(y)>1 else 0.0
-    for t in range(1,len(y)):
-        prev=level
-        level = a*y.iloc[t] + (1-a)*(level+trend)
-        trend = b*(level-prev) + (1-b)*trend
-    return np.array([level + (i+1)*trend for i in range(h)])
+    for t in range(len(y)):
+        # índice estacional que toca
+        s_idx = t - m
+        S_tm = S_list[s_idx] if s_idx >= 0 else S_list[s_idx % m]
+        # pronóstico dentro de la muestra (1 paso adelante)
+        # Ft = (L + B) * S_{t-m}
+        Ft = (L + B) * S_tm
 
-def _linear_trend(y,h):
-    if len(y)<2: return _naive(y,h)
-    x=np.arange(len(y)); a,b=np.polyfit(x, y.values.astype(float), 1)
-    return a*np.arange(len(y), len(y)+h) + b
+        # actualizar con la observación Y_t
+        Yt = y.iloc[t]
+        L_new = alpha * (Yt / S_tm) + (1-alpha) * (L + B)
+        B_new = beta * (L_new - L) + (1-beta) * B
+        S_new = gamma * (Yt / L_new) + (1-gamma) * S_tm
 
-def _croston(y,h,a=0.3):
+        L, B = L_new, B_new
+        if s_idx >= 0:
+            S_list[t] = S_new
+        else:
+            # antes de completar el primer año, extendemos
+            S_list.append(S_new)
+
+        L_hist.append(L); B_hist.append(B)
+
+    # pronóstico futuro
+    idx = pd.date_range(y.index[-1] + pd.offsets.MonthBegin(1), periods=h, freq="MS")
+    yhat = []
+    for k in range(1, h+1):
+        s_idx = len(y) - m + k
+        S_k = S_list[s_idx] if s_idx < len(S_list) else S_list[s_idx % m]
+        yhat.append((L + k*B) * S_k)
+    return np.array(yhat, dtype=float)
+
+def fc_croston(y: pd.Series, h: int, alpha: float=0.3) -> np.ndarray:
+    # Croston clásico para demanda intermitente
     y = y.fillna(0).astype(float)
-    z = None  # demanda media
-    p = None  # intervalo medio
-    q = 0     # contador intervalo actual
+    z, p, q = None, None, 0
     for v in y:
-        if v>0:
-            z = v if z is None else a*v + (1-a)*z
-            p = 1 if p is None else a*q + (1-a)*p
+        if v > 0:
+            z = v if z is None else alpha*v + (1-alpha)*z
+            p = 1 if p is None else alpha*q + (1-alpha)*p
             q = 1
         else:
             q = (q or 0) + 1
-    if z is None: return np.zeros(h)
-    if not p: p = 1.0
+    if z is None:
+        return np.zeros(h)
+    if not p:
+        p = 1.0
     rate = z/p
     return np.repeat(rate, h)
 
-# Catálogo de candidatos
-def candidate_methods(seasonal_periods=12):
-    return {
-        "Naive": _naive,
-        "SeasonalNaive": lambda y,H: _seasonal_naive(y,H,m=seasonal_periods),
-        "MovingAvg": _moving_average,
-        "WMA": _wma,
-        "SES": _ses,
-        "Holt": _holt,
-        "LinearTrend": _linear_trend,
-        "Croston": _croston,
-    }
-
-# Backtesting + torneo
-def time_series_cv(series, h=3, initial=18, step=1, m=12):
-    y=series.dropna()
-    if len(y)<max(initial,h)+2:
-        return {"best": None, "metrics": {}}
-    methods = candidate_methods(m)
-    errs={k:[] for k in methods}
-    for end in range(initial, len(y)-h+1, step):
-        tr=y.iloc[:end]; ts=y.iloc[end:end+h]
-        for name,fn in methods.items():
-            try:
-                pred = fn(tr, h)
-            except Exception:
-                pred = np.repeat(np.nan, h)
-            errs[name].append(smape(ts.values, pred))
-    avg = {k: np.nanmean(v) for k,v in errs.items()}
-    best = min(avg, key=avg.get)
-    return {"best": best, "metrics": avg}
-
-# Pronóstico de TODOS los métodos (con captura de errores)
-def forecast_all(series, horizon, seasonal_periods=12):
-    methods = candidate_methods(seasonal_periods)
-    idx = pd.date_range(series.index[-1] + pd.offsets.MonthBegin(1), periods=horizon, freq="MS")
-    df_all = pd.DataFrame({"fecha": idx})
-    errors = {}
-    error_msgs = {}
-
-    # backtesting (mismas condiciones que el best)
-    mets = time_series_cv(series, h=min(horizon, 6),
-                          initial=min(18, max(12, len(series)//2)),
-                          m=seasonal_periods)
-    errors = mets.get("metrics", {}) if mets else {}
-    best   = mets.get("best") if mets else None
-
-    for name, fn in methods.items():
+# =============== Backtesting & tuning ===============
+def rolling_origin_backtest(y: pd.Series, horizon: int, initial: int, m: int,
+                            method_name: str, param: dict) -> float:
+    """Devuelve sMAPE promedio para el método con params dados."""
+    errors: List[float] = []
+    for end in range(initial, len(y) - horizon + 1):
+        train = y.iloc[:end]
+        test  = y.iloc[end:end+horizon]
         try:
-            df_all[name] = fn(series, horizon)
-        except Exception as e:
-            df_all[name] = np.nan
-            error_msgs[name] = str(e)
+            if method_name == "Naive":
+                pred = fc_naive(train, horizon)
+            elif method_name == "SeasonalNaive":
+                pred = fc_seasonal_naive(train, horizon, m=m)
+            elif method_name == "Holt":
+                pred = fc_holt(train, horizon, alpha=param["alpha"], beta=param["beta"])
+            elif method_name == "HoltWintersM":
+                pred = fc_holt_winters_mul(train, horizon, alpha=param["alpha"], beta=param["beta"],
+                                           gamma=param["gamma"], m=m)
+            elif method_name == "Croston":
+                pred = fc_croston(train, horizon, alpha=param["alpha"])
+            else:
+                pred = np.repeat(np.nan, horizon)
+        except Exception:
+            pred = np.repeat(np.nan, horizon)
+        errors.append(smape(test.values, pred))
+    return float(np.nanmean(errors)) if errors else np.inf
 
-    return best, errors, error_msgs, df_all
+def tune_method(y: pd.Series, method_name: str, horizon: int, m: int=12) -> Tuple[dict, float]:
+    """Búsqueda de parámetros por rejilla simple; retorna (mejores_params, sMAPE)."""
+    y = y.astype(float)
+    initial = min( max(12, len(y)//2), len(y)-horizon-1 )
+    if initial <= 0:
+        return ({}, np.inf)
 
-# =============================
-# Sidebar: carga y mapeo
-# =============================
+    if method_name == "Naive":
+        return ({}, rolling_origin_backtest(y, horizon, initial, m, "Naive", {}))
+    if method_name == "SeasonalNaive":
+        return ({"m": m}, rolling_origin_backtest(y, horizon, initial, m, "SeasonalNaive", {"m":m}))
+    if method_name == "Croston":
+        best, best_err = None, np.inf
+        for a in [0.1, 0.2, 0.3, 0.5]:
+            err = rolling_origin_backtest(y, horizon, initial, m, "Croston", {"alpha":a})
+            if err < best_err: best, best_err = {"alpha":a}, err
+        return (best, best_err)
+    if method_name == "Holt":
+        best, best_err = None, np.inf
+        for a in [0.1, 0.2, 0.3, 0.5, 0.8]:
+            for b in [0.05, 0.1, 0.2, 0.3]:
+                err = rolling_origin_backtest(y, horizon, initial, m, "Holt", {"alpha":a, "beta":b})
+                if err < best_err: best, best_err = {"alpha":a,"beta":b}, err
+        return (best, best_err)
+    if method_name == "HoltWintersM":
+        best, best_err = None, np.inf
+        for a in [0.1, 0.2, 0.3]:
+            for b in [0.05, 0.1, 0.2]:
+                for g in [0.05, 0.1, 0.2, 0.3]:
+                    err = rolling_origin_backtest(y, horizon, initial, m, "HoltWintersM",
+                                                  {"alpha":a, "beta":b, "gamma":g})
+                    if err < best_err: best, best_err = {"alpha":a,"beta":b,"gamma":g}, err
+        return (best, best_err)
+    return ({}, np.inf)
+
+def forecast_with_best(y: pd.Series, horizon: int, m: int=12) -> Tuple[pd.DataFrame, Dict[str,float], Dict[str,pd.DataFrame]]:
+    """Entrena cada método, selecciona mejores parámetros por sMAPE y produce pronóstico de TODOS.
+       Retorna: (df_merged_all, metrics_dict, dict_method_to_df)"""
+    methods = ["Naive","SeasonalNaive","Holt","HoltWintersM","Croston"]
+    metrics: Dict[str,float] = {}
+    dfs: Dict[str,pd.DataFrame] = {}
+    idx = pd.date_range(y.index[-1] + pd.offsets.MonthBegin(1), periods=horizon, freq="MS")
+    df_all = pd.DataFrame({"fecha": idx})
+
+    for name in methods:
+        params, err = tune_method(y, name, horizon, m)
+        metrics[name] = err
+        # forecast final con mejores params
+        if name == "Naive":
+            yhat = fc_naive(y, horizon)
+        elif name == "SeasonalNaive":
+            yhat = fc_seasonal_naive(y, horizon, m=m)
+        elif name == "Holt":
+            yhat = fc_holt(y, horizon, alpha=params["alpha"], beta=params["beta"])
+        elif name == "HoltWintersM":
+            yhat = fc_holt_winters_mul(y, horizon, alpha=params["alpha"], beta=params["beta"], gamma=params["gamma"], m=m)
+        elif name == "Croston":
+            yhat = fc_croston(y, horizon, alpha=params["alpha"])
+        else:
+            yhat = np.repeat(np.nan, horizon)
+
+        df_m = pd.DataFrame({"fecha": idx, "yhat": yhat})
+        dfs[name] = df_m.copy()
+        df_all[name] = yhat
+
+    return df_all, metrics, dfs
+
+# =============== UI: carga & mapeo ===============
 st.sidebar.header("1) Cargar archivo")
 file = st.sidebar.file_uploader("Excel (.xlsx/.xls) o CSV", type=["xlsx","xls","csv"])
 if not file:
@@ -236,6 +319,9 @@ if not file:
     st.stop()
 
 raw = pd.read_excel(file) if file.name.lower().endswith(("xlsx","xls")) else pd.read_csv(file)
+with st.expander("👀 Vista previa", expanded=False):
+    st.dataframe(raw.head(200), use_container_width=True)
+
 st.sidebar.header("2) Mapear columnas")
 cols = raw.columns.tolist()
 fecha_col    = st.sidebar.selectbox("Fecha", cols)
@@ -245,14 +331,12 @@ precio_col   = st.sidebar.selectbox("Precio", cols)
 
 try:
     dfm = coerce_schema(raw, {"fecha":fecha_col,"servicio":servicio_col,"cantidad":cantidad_col,"precio":precio_col})
-    st.sidebar.success("Esquema normalizado ✅")
+    st.sidebar.success("Esquema normalizado ✅ (mensual por servicio)")
 except Exception as e:
     st.sidebar.error(f"Error: {e}")
     st.stop()
 
-# =============================
-# EDA rápida
-# =============================
+# =============== EDA breve ===============
 st.header("Exploración")
 c1,c2,c3,c4 = st.columns(4)
 c1.metric("Servicios (total)", f"{int(dfm['cantidad'].sum()):,}")
@@ -264,121 +348,90 @@ fig_total = px.line(dfm.groupby("fecha", as_index=False)["cantidad"].sum(),
                     x="fecha", y="cantidad", markers=True, title="Demanda total mensual")
 st.plotly_chart(fig_total, use_container_width=True)
 
-# =============================
-# Pronóstico
-# =============================
-st.header("Pronóstico de demanda")
-nivel = st.radio("Nivel", ["Por servicio", "Por tipo (Lavado/Reparación)", "Total"], index=0)
+# =============== Pronóstico ===============
+st.header("Pronóstico de demanda (5 métodos)")
+nivel = st.radio("Nivel", ["Por servicio","Por tipo (Lavado/Reparación)","Total"], index=0)
 horizonte = st.selectbox("Horizonte (meses)", [3,6,9,12], index=1)
+m = 12  # estacionalidad mensual
 
-def export_excel_all(df_methods_dict, metrics, filename):
-    """df_methods_dict: {metodo: DataFrame(fecha, yhat)}, metrics: {metodo: sMAPE}"""
-    bio = io.BytesIO()
-    with pd.ExcelWriter(bio, engine="xlsxwriter") as writer:
-        # Ranking de métricas
-        met_df = pd.DataFrame(sorted(metrics.items(), key=lambda x: x[1]), columns=["Modelo","sMAPE"])
-        met_df.to_excel(writer, index=False, sheet_name="metricas")
-        # Una hoja por método
-        for name, dfmth in df_methods_dict.items():
-            # Agregar sMAPE en la hoja (encabezado)
-            # Escribimos una fila con el valor y luego la tabla
-            sheet = name[:31] if len(name)>31 else name  # Excel sheet name limit
-            start_row = 0
-            tmp = pd.DataFrame({"sMAPE":[metrics.get(name, np.nan)]})
-            tmp.to_excel(writer, index=False, sheet_name=sheet, startrow=start_row)
-            dfmth.to_excel(writer, index=False, sheet_name=sheet, startrow=start_row+2)
-    return bio.getvalue()
+def export_all_sheets(dfs: Dict[str,pd.DataFrame], metrics: Dict[str,float], fname: str) -> bytes:
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="xlsxwriter") as w:
+        # ranking de métricas
+        met = pd.DataFrame(sorted(metrics.items(), key=lambda x: x[1]), columns=["Modelo","sMAPE"])
+        met.to_excel(w, index=False, sheet_name="metricas")
+        # una hoja por método
+        for name, d in dfs.items():
+            sheet = name[:31]
+            # título con sMAPE
+            pd.DataFrame({"sMAPE":[metrics.get(name, np.nan)]}).to_excel(w, index=False, sheet_name=sheet, startrow=0)
+            d.to_excel(w, index=False, sheet_name=sheet, startrow=2)
+    return buf.getvalue()
 
-def show_all_methods_ui(y, title_prefix=""):
-    """Pronostica con todos los métodos, muestra: best, métricas, errores y pestañas con gráfica+tabla por método.
-       Retorna dict {metodo: df(fecha,yhat)} y dict metrics."""
-    best, errs, error_msgs, df_all = forecast_all(y, horizonte, seasonal_periods=12)
+def run_block(title: str, g: pd.DataFrame):
+    st.subheader(title)
+    y = g.set_index("fecha")["cantidad"].astype(float)
+    if len(y) < 8:
+        st.warning("Serie muy corta para tuning robusto; resultados orientativos.")
+    df_all, metrics, dfs = forecast_with_best(y, horizon=horizonte, m=m)
 
-    # Métricas (tabla)
-    if errs:
-        st.subheader("Métricas (sMAPE ↓)")
-        met_df = pd.DataFrame(sorted(errs.items(), key=lambda x: x[1]), columns=["Modelo","sMAPE"])
-        st.dataframe(met_df, use_container_width=True)
-        st.success(f"Mejor modelo: {best}")
-    else:
-        st.info("Serie corta para backtesting.")
+    # gráfico: histórico + mejor modelo
+    best = min(metrics, key=metrics.get)
+    hist = g[["fecha","cantidad"]].rename(columns={"cantidad":"y"}).assign(serie="histórico")
+    best_df = dfs[best].rename(columns={"yhat":"y"}).assign(serie=f"pronóstico ({best})")
+    fig = px.line(pd.concat([hist, best_df]), x="fecha", y="y", color="serie",
+                  title=f"{title} – mejor: {best} (sMAPE={metrics[best]:.2f})", markers=True)
+    st.plotly_chart(fig, use_container_width=True)
 
-    # Tabs por método
-    dfs_por_metodo = {}
-    tabs = st.tabs(list(df_all.columns[df_all.columns!='fecha']))
-    hist_df = y.reset_index().rename(columns={y.name:"y"})
-    for tab, metodo in zip(tabs, [c for c in df_all.columns if c!='fecha']):
+    # comparación: todos los métodos
+    plot_m = df_all.melt(id_vars=["fecha"], var_name="modelo", value_name="yhat")
+    fig_all = px.line(plot_m, x="fecha", y="yhat", color="modelo",
+                      title=f"{title} – comparación de los 5 métodos")
+    fig_all.add_scatter(x=hist["fecha"], y=hist["y"], mode="lines+markers", name="histórico", line=dict(dash="dot"))
+    st.plotly_chart(fig_all, use_container_width=True)
+
+    # métricas y tablas
+    st.subheader("Métricas (sMAPE ↓)")
+    st.dataframe(pd.DataFrame(sorted(metrics.items(), key=lambda x: x[1]), columns=["Modelo","sMAPE"]),
+                 use_container_width=True)
+
+    st.subheader("Tablas de Y por método")
+    tabs = st.tabs(list(dfs.keys()))
+    for tab, (name, d) in zip(tabs, dfs.items()):
         with tab:
-            if metodo in error_msgs:
-                st.error(f"Error en {metodo}: {error_msgs[metodo]}")
-            this = df_all[["fecha", metodo]].rename(columns={metodo:"yhat"})
-            dfs_por_metodo[metodo] = this.copy()
-            # Gráfica
-            plot_df = pd.concat([
-                hist_df.rename(columns={"y":"valor"}).assign(serie="histórico"),
-                this.rename(columns={"yhat":"valor"}).assign(serie=f"pronóstico ({metodo})")
-            ], ignore_index=True)
-            fig = px.line(plot_df, x="fecha", y="valor", color="serie",
-                          title=f"{title_prefix} – {metodo}")
-            st.plotly_chart(fig, use_container_width=True)
-            # Tabla de Y de este método
-            st.dataframe(this, use_container_width=True)
-            # sMAPE del método
-            sm = errs.get(metodo, np.nan)
-            st.caption(f"sMAPE {metodo}: {sm:.3f}" if pd.notna(sm) else f"sMAPE {metodo}: N/D")
+            st.write(f"**{name}**  • sMAPE={metrics[name]:.3f}")
+            st.dataframe(d, use_container_width=True)
 
-    return dfs_por_metodo, errs
+    # exportar excel
+    st.subheader("Descarga")
+    st.download_button(
+        "💾 Descargar Excel (una hoja por método + métricas)",
+        data=export_all_sheets(dfs, metrics, "pronosticos.xlsx"),
+        file_name=f"pronosticos_{title.replace(' ','_')}_{datetime.now().date()}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
 
-# ---- POR SERVICIO ----
+# ---- Por servicio ----
 if nivel == "Por servicio":
     servicios = sorted(dfm["servicio"].unique())
     sel_all = st.checkbox("Seleccionar todos los servicios", value=False)
-    seleccion = servicios if sel_all else st.multiselect("Elegí servicio(s)", servicios)
-    if not seleccion:
-        st.stop()
-
-    excel_buffers = []  # para juntar descargas por cada servicio
-    for s in seleccion:
-        st.subheader(f"🔧 {s}")
+    svcs = servicios if sel_all else st.multiselect("Elegí servicio(s)", servicios)
+    if not svcs: st.stop()
+    for s in svcs:
         g = dfm[dfm["servicio"]==s].sort_values("fecha")
-        y = g.set_index("fecha")["cantidad"]
-        dfs_por_metodo, metrics = show_all_methods_ui(y, title_prefix=s)
-        # botón de descarga por servicio (una hoja por método)
-        data = export_excel_all(dfs_por_metodo, metrics, f"pronostico_{s}.xlsx")
-        st.download_button(
-            f"💾 Descargar Excel (métodos) – {s}",
-            data=data,
-            file_name=f"pronostico_{s}_{datetime.now().date()}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
+        run_block(f"🔧 {s}", g)
 
-# ---- POR TIPO ----
+# ---- Por tipo ----
 elif nivel == "Por tipo (Lavado/Reparación)":
     tipos = st.multiselect("Elegí tipo(s)", ["Lavado","Reparación"], default=["Lavado","Reparación"])
     if not tipos: st.stop()
     for t in tipos:
-        st.subheader(f"🧩 {t}")
-        g = dfm[dfm["tipo_servicio"]==t].groupby("fecha", as_index=False)["cantidad"].sum()
-        y = g.set_index("fecha")["cantidad"]
-        dfs_por_metodo, metrics = show_all_methods_ui(y, title_prefix=t)
-        data = export_excel_all(dfs_por_metodo, metrics, f"pronostico_{t}.xlsx")
-        st.download_button(
-            f"💾 Descargar Excel (métodos) – {t}",
-            data=data,
-            file_name=f"pronostico_{t}_{datetime.now().date()}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
+        g = (dfm[dfm["tipo_servicio"]==t].groupby("fecha", as_index=False)["cantidad"].sum()
+             .assign(servicio=t, tipo_servicio=t))
+        run_block(f"🧩 {t}", g)
 
-# ---- TOTAL ----
+# ---- Total ----
 else:
-    st.subheader("📦 TOTAL")
-    g = dfm.groupby("fecha", as_index=False)["cantidad"].sum()
-    y = g.set_index("fecha")["cantidad"]
-    dfs_por_metodo, metrics = show_all_methods_ui(y, title_prefix="TOTAL")
-    data = export_excel_all(dfs_por_metodo, metrics, "pronostico_total.xlsx")
-    st.download_button(
-        "💾 Descargar Excel (métodos) – TOTAL",
-        data=data,
-        file_name=f"pronostico_total_{datetime.now().date()}.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
+    g = dfm.groupby("fecha", as_index=False)["cantidad"].sum().assign(servicio="TOTAL", tipo_servicio="TOTAL")
+    run_block("📦 TOTAL", g)
+
