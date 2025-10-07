@@ -156,40 +156,55 @@ def _init_seasonal_multiplicative(y: pd.Series, m: int=12) -> Tuple[float, float
     return float(L0), float(B0), S.astype(float)
 
 def fc_holt_winters_mul(y: pd.Series, h: int, alpha: float, beta: float, gamma: float, m: int=12) -> np.ndarray:
-    # HW multiplicativo: Ft = (L_{t-1}+B_{t-1}) * S_{t-m}
-    # Updates:
-    # L_t = α*(Y_t / S_{t-m}) + (1-α)*(L_{t-1}+B_{t-1})
-    # B_t = β*(L_t - L_{t-1}) + (1-β)*B_{t-1}
-    # S_t = γ*(Y_t / L_t) + (1-γ)*S_{t-m}
+    """
+    Holt–Winters multiplicativo (nivel + tendencia aditivos, estacionalidad multiplicativa).
+    Convención de 1-step-ahead dentro de la muestra: F_t = (L_{t-1} + B_{t-1}) * S_{t-m}
+    Actualizaciones:
+      L_t = α*(Y_t / S_{t-m}) + (1-α)*(L_{t-1}+B_{t-1})
+      B_t = β*(L_t - L_{t-1}) + (1-β)*B_{t-1}
+      S_t = γ*(Y_t / L_t)     + (1-γ)*S_{t-m}
+    NOTA: mantenemos exactamente m índices estacionales y los actualizamos en anillo (índice módulo m).
+    """
     y = y.astype(float)
-    if len(y) < m+2:
+    n = len(y)
+    if n < m + 2:
+        # muy corta: cae a Seasonal Naive con ese m
         return fc_seasonal_naive(y, h, m=m)
-    L, B, S = _init_seasonal_multiplicative(y, m=m)
-    S_list = list(S)  # crecerá con el tiempo
 
-    for t in range(len(y)):
-        s_idx = t - m
-        S_tm = S_list[s_idx] if s_idx >= 0 else S_list[s_idx % m]
-        Ft = (L + B) * S_tm
+    # Inicialización clásica
+    L, B, S0 = _init_seasonal_multiplicative(y, m=m)
+    # Guardamos solo m factores en un arreglo circular
+    S = np.array(S0, dtype=float)  # shape (m,)
+
+    # Recorremos la muestra
+    L_prev, B_prev = L, B
+    for t in range(n):
+        # índice del factor usado para este t (S_{t-m})
+        s_idx_prev = (t - m) % m
+        S_tm = S[s_idx_prev]
+
+        # 1-step ahead forecast dentro de la muestra (no lo devolvemos aquí)
+        # Ft = (L_{t-1}+B_{t-1}) * S_{t-m}
+
         Yt = y.iloc[t]
-        L_new = alpha * (Yt / S_tm) + (1-alpha) * (L + B)
-        B_new = beta  * (L_new - L) + (1-beta) * B
-        S_new = gamma * (Yt / L_new) + (1-gamma) * S_tm
+        # Actualizaciones
+        L_t = alpha * (Yt / S_tm) + (1 - alpha) * (L_prev + B_prev)
+        B_t = beta  * (L_t - L_prev) + (1 - beta) * B_prev
+        S_t = gamma * (Yt / L_t)     + (1 - gamma) * S_tm
 
-        L, B = L_new, B_new
-        if s_idx >= 0:
-            S_list[t] = S_new
-        else:
-            S_list.append(S_new)
+        # Escribimos S_t en la posición "t % m" (circular)
+        S[t % m] = S_t
+        L_prev, B_prev = L_t, B_t
 
-    # pronóstico futuro
+    # Pronóstico futuro h pasos adelante
     idx = pd.date_range(y.index[-1] + pd.offsets.MonthBegin(1), periods=h, freq="MS")
-    yhat = []
-    for k in range(1, h+1):
-        s_idx = len(y) - m + k
-        S_k = S_list[s_idx] if s_idx < len(S_list) else S_list[s_idx % m]
-        yhat.append((L + k*B) * S_k)
-    return np.array(yhat, dtype=float)
+    yhat = np.empty(h, dtype=float)
+    for k in range(1, h + 1):
+        # S_{n - m + k} → índice circular:
+        s_idx_future = (n - m + k) % m
+        yhat[k - 1] = (L_prev + k * B_prev) * S[s_idx_future]
+
+    return yhat
 
 def fc_croston(y: pd.Series, h: int, alpha: float=0.3) -> np.ndarray:
     # Croston clásico para demanda intermitente
